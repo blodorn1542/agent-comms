@@ -1,0 +1,19 @@
+{
+  "name": "agent-comms",
+  "version": "1.0.0",
+  "description": "Shared communication layer for the agent platform. One interface agents call; Gmail and Quo are adapters behind it. Sending is gated and off by default.",
+  "license": "UNLICENSED",
+  "private": true,
+  "type": "commonjs",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "lib/"
+  ],
+  "scripts": {
+    "test": "node --test \"test/*.test.js\""
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}
