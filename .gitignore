@@ -2,9 +2,14 @@ node_modules/
 *.db
 *.db-wal
 *.db-shm
+
+# Secrets. The bare name, every suffixed variant, and every *.env file
+# (quo.env, elite-pools.env, local.env) - the last one is the easy miss.
 .env
 .env.*
+*.env
 !.env.example
+
 npm-debug.log*
 .DS_Store
 .vscode/

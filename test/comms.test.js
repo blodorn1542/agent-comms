@@ -276,31 +276,221 @@ test('a tenant only polls inbound providers it has switched on', () => {
   );
 });
 
-test('Quo ingest keeps inbound only, and is driven entirely by injected fetch', async () => {
-  const pages = {
-    '/phone-numbers': { data: [{ id: 'PN1', phoneNumber: '+15550199' }] },
-    '/messages': { data: [
-      { id: 'M1', direction: 'inbound', from: '+15550100', to: ['+15550199'],
-        content: 'call me', createdAt: '2026-09-17T10:00:00Z' },
-      { id: 'M2', direction: 'outbound', from: '+15550199', to: ['+15550100'],
-        content: 'ours', createdAt: '2026-09-17T10:05:00Z' },
-    ] },
-    '/calls': { data: [] },
+/**
+ * The fixture below uses Quo's REAL vocabulary, verified 2026-09-18 against
+ * the published OpenAPI spec: direction is "incoming"/"outgoing", the text
+ * lives in `text`, and list responses are { data, nextPageToken }. An earlier
+ * revision of the adapter filtered on "inbound" and read `content`, which
+ * matches nothing Quo actually sends and ingested an empty set. Keep this
+ * fixture honest to the spec - it is the only thing standing between us and
+ * that bug coming back.
+ */
+function quoWorkspace() {
+  return {
+    '/v1/phone-numbers': { data: [{ id: 'PN1', number: '+15550199', name: 'Main' }] },
+    '/v1/conversations': { data: [
+      { id: 'CN1', phoneNumberId: 'PN1', participants: ['+15550100'] },
+    ], nextPageToken: null },
+    '/v1/messages': { data: [
+      { id: 'M1', direction: 'incoming', from: '+15550100', to: ['+15550199'],
+        text: 'call me', conversationId: 'CN1', status: 'received',
+        createdAt: '2026-09-17T10:00:00Z' },
+      { id: 'M2', direction: 'outgoing', from: '+15550199', to: ['+15550100'],
+        text: 'ours', conversationId: 'CN1', status: 'sent',
+        createdAt: '2026-09-17T10:05:00Z' },
+    ], nextPageToken: null },
+    '/v1/calls': { data: [
+      { id: 'AC1', direction: 'incoming', participants: ['+15550100', '+15550199'],
+        status: 'completed', duration: 63, createdAt: '2026-09-17T11:00:00Z' },
+      { id: 'AC2', direction: 'outgoing', participants: ['+15550100', '+15550199'],
+        status: 'completed', duration: 12, createdAt: '2026-09-17T11:30:00Z' },
+    ], nextPageToken: null },
+    '/v1/call-summaries/': { data: { callId: 'AC1', status: 'completed',
+      summary: ['Customer asked about the pool heater.'],
+      nextSteps: ['Send a quote.'] } },
   };
-  const fetchImpl = async (url) => {
-    const key = Object.keys(pages).find((k) => url.includes(k));
+}
+
+/** Records every request so a test can assert on the verbs actually used. */
+function recordingFetch(pages, log = []) {
+  return async (url, init = {}) => {
+    log.push({ url, method: init.method ?? 'GET' });
+    const key = Object.keys(pages).sort((a, b) => b.length - a.length)
+      .find((k) => url.includes(k));
     return { ok: true, status: 200, text: async () => JSON.stringify(pages[key] ?? {}) };
   };
-  const c = createComms({ dbPath: DB, fetchImpl });
+}
+
+test('Quo ingest keeps incoming only, using Quo\'s real direction vocabulary', async () => {
+  const c = createComms({ dbPath: DB, fetchImpl: recordingFetch(quoWorkspace()) });
   c.connections.save('tq', 'quo', { accessToken: 'key-123', refreshToken: null });
 
   const out = await c.poll({ tenant: 'tq', config: cfg(), provider: 'quo' });
   assert.equal(out.ok, true);
   assert.equal(out.messages, 2, 'both directions are seen');
-  assert.equal(out.newRows, 1, 'only the inbound one is stored');
+  assert.equal(out.calls, 2);
+  assert.equal(out.newRows, 2, 'one incoming text and one incoming call are stored');
+
   const stored = c.store.recentInbound('tq', 10);
-  assert.equal(stored.length, 1);
-  assert.equal(stored[0].external_id, 'M1');
+  assert.deepEqual(stored.map((r) => r.external_id).sort(), ['AC1', 'M1']);
+
+  const sms = stored.find((r) => r.external_id === 'M1');
+  assert.equal(sms.channel, 'sms');
+  assert.equal(sms.body, 'call me', 'the text comes from `text`, not `content`');
+  assert.equal(sms.from_addr, '+15550100');
+
+  const call = stored.find((r) => r.external_id === 'AC1');
+  assert.equal(call.channel, 'call');
+  assert.match(call.body, /pool heater/);
+  assert.match(call.body, /Next steps: Send a quote\./);
+  assert.equal(call.from_addr, '+15550100', 'the caller, not the tenant\'s own number');
+});
+
+test('a call with no summary is still recorded, without one', async () => {
+  const pages = quoWorkspace();
+  pages['/v1/call-summaries/'] = { data: { callId: 'AC1', status: 'absent' } };
+  const c = createComms({ dbPath: DB, fetchImpl: recordingFetch(pages) });
+  c.connections.save('tq-abs', 'quo', { accessToken: 'k', refreshToken: null });
+
+  const out = await c.poll({ tenant: 'tq-abs', config: cfg(), provider: 'quo' });
+  assert.equal(out.newRows, 2, 'the call is ingested even with no summary');
+  assert.match(out.note, /no-answer/,
+    'an absent summary is normal, and must not be blamed on the plan');
+  assert.doesNotMatch(out.note, /Business\/Scale/);
+  const call = c.store.recentInbound('tq-abs', 10).find((r) => r.external_id === 'AC1');
+  assert.equal(call.body, null);
+  assert.equal(JSON.parse(call.meta_json).hasSummary, false);
+});
+
+/**
+ * 404 vs 403 on a summary, verified live 2026-09-18. A 404 is the ordinary
+ * "this call was never summarized" and must not be reported as a billing
+ * problem; only 402/403 mean the plan. Getting this backwards sends the owner
+ * to upgrade a plan that is already correct.
+ */
+test('a 404 on summaries is not blamed on the plan', async () => {
+  const pages = quoWorkspace();
+  const fetchImpl = async (url) => {
+    if (url.includes('/v1/call-summaries/')) {
+      return { ok: false, status: 404,
+               text: async () => JSON.stringify({ code: '0500404' }) };
+    }
+    const key = Object.keys(pages).sort((a, b) => b.length - a.length)
+      .find((k) => url.includes(k));
+    return { ok: true, status: 200, text: async () => JSON.stringify(pages[key] ?? {}) };
+  };
+  const c = createComms({ dbPath: DB, fetchImpl });
+  c.connections.save('tq-404', 'quo', { accessToken: 'k', refreshToken: null });
+
+  const out = await c.poll({ tenant: 'tq-404', config: cfg(), provider: 'quo' });
+  assert.equal(out.newRows, 2, 'a 404 on the summary never loses the call itself');
+  assert.doesNotMatch(out.note, /Business\/Scale/);
+  assert.match(out.note, /never summarized/);
+});
+
+test('a 403 on summaries is reported as the plan limit it is', async () => {
+  const pages = quoWorkspace();
+  const fetchImpl = async (url, init = {}) => {
+    if (url.includes('/v1/call-summaries/')) {
+      return { ok: false, status: 403,
+               text: async () => JSON.stringify({ message: 'forbidden' }) };
+    }
+    const key = Object.keys(pages).sort((a, b) => b.length - a.length)
+      .find((k) => url.includes(k));
+    return { ok: true, status: 200, text: async () => JSON.stringify(pages[key] ?? {}) };
+  };
+  const c = createComms({ dbPath: DB, fetchImpl });
+  c.connections.save('tq-403', 'quo', { accessToken: 'k', refreshToken: null });
+
+  const out = await c.poll({ tenant: 'tq-403', config: cfg(), provider: 'quo' });
+  assert.equal(out.newRows, 2, 'a 403 on the summary never loses the call itself');
+  assert.match(out.note, /Business\/Scale/);
+});
+
+test('the required phoneNumberId and participants params are actually sent', async () => {
+  const log = [];
+  const c = createComms({ dbPath: DB, fetchImpl: recordingFetch(quoWorkspace(), log) });
+  c.connections.save('tq-p', 'quo', { accessToken: 'k', refreshToken: null });
+  await c.poll({ tenant: 'tq-p', config: cfg(), provider: 'quo' });
+
+  const messages = log.find((r) => r.url.includes('/v1/messages'));
+  assert.ok(messages, 'messages were requested');
+  const q = new URL(messages.url).searchParams;
+  assert.equal(q.get('phoneNumberId'), 'PN1');
+  assert.deepEqual(q.getAll('participants'), ['+15550100'],
+    'participants is required by Quo and is serialized as repeated keys');
+  assert.ok(Number(q.get('maxResults')) > 0, 'maxResults is required by Quo');
+});
+
+/**
+ * Found against the live API on 2026-09-18, not in the spec: `participants` is
+ * typed as an unbounded array but the server rejects more than one with
+ * 400 "Expected array length to be less or equal to 1". A group conversation
+ * must be split into one request per counterparty.
+ */
+test('a group conversation is queried one participant at a time', async () => {
+  const log = [];
+  const pages = quoWorkspace();
+  pages['/v1/conversations'] = { data: [
+    { id: 'CN1', phoneNumberId: 'PN1', participants: ['+15550100'] },
+    { id: 'CN2', phoneNumberId: 'PN1', participants: ['+15550111', '+15550122'] },
+    // The same counterparty on a second conversation must not be walked twice.
+    { id: 'CN3', phoneNumberId: 'PN1', participants: ['+15550100', '+15550199'] },
+  ], nextPageToken: null };
+
+  const c = createComms({ dbPath: DB, fetchImpl: recordingFetch(pages, log) });
+  c.connections.save('tq-grp', 'quo', { accessToken: 'k', refreshToken: null });
+  await c.poll({ tenant: 'tq-grp', config: cfg(), provider: 'quo' });
+
+  const queried = log
+    .filter((r) => r.url.includes('/v1/messages') || r.url.includes('/v1/calls'))
+    .map((r) => new URL(r.url).searchParams.getAll('participants'));
+
+  assert.ok(queried.length > 0, 'messages and calls were requested');
+  for (const p of queried) {
+    assert.equal(p.length, 1, 'Quo rejects more than one participant: got ' + p.join(','));
+  }
+
+  const distinct = [...new Set(queried.map((p) => p[0]))].sort();
+  assert.deepEqual(distinct, ['+15550100', '+15550111', '+15550122'],
+    'every counterparty is covered exactly once, and the tenant\'s own number is excluded');
+});
+
+/* ------------------------- guardrail: Quo is read-only at the wire level --- */
+
+test('every request the Quo adapter makes is a GET', async () => {
+  const log = [];
+  const c = createComms({ dbPath: DB, fetchImpl: recordingFetch(quoWorkspace(), log) });
+  c.connections.save('tq-ro', 'quo', { accessToken: 'k', refreshToken: null });
+
+  await c.poll({ tenant: 'tq-ro', config: cfg(), provider: 'quo' });
+  await c.adapters.quo.probe('tq-ro');
+
+  assert.ok(log.length > 0, 'the adapter did reach the network');
+  const verbs = [...new Set(log.map((r) => r.method))];
+  assert.deepEqual(verbs, ['GET'],
+    'a non-GET from this adapter is a read-only violation: ' + verbs.join(','));
+});
+
+test('the Quo adapter refuses a non-GET or a write-capable path before the network', () => {
+  const { assertReadOnlyPath } = adapters.quo;
+  assert.equal(assertReadOnlyPath('GET', '/v1/messages'), true);
+  assert.throws(() => assertReadOnlyPath('POST', '/v1/messages'),
+    /read-only: refusing a POST/);
+  // Quo's own write endpoints are unreachable even by a GET-shaped mistake.
+  for (const p of ['/v1/webhooks', '/v1/tasks', '/v1/contacts',
+                   '/v1/conversations/CN1/mark-as-read']) {
+    assert.throws(() => assertReadOnlyPath('GET', p), /read-only/, p + ' must be refused');
+  }
+});
+
+test('the Quo adapter exposes no function that could transmit', () => {
+  const surface = Object.keys(adapters.quo.create({
+    store: comms.store, connections: comms.connections, fetchImpl: async () => {},
+  }));
+  const writeish = surface.filter((k) => /^(send|transmit|post|create|update|delete|reply)/i.test(k));
+  assert.deepEqual(writeish, [],
+    'the Quo surface must contain nothing that looks like a send path: ' + writeish.join(','));
 });
 
 test('Quo authenticates with the bare API key, not a Bearer token', async () => {

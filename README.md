@@ -40,11 +40,62 @@ createComms({ db, sendEnabled: false })
 | `gmail` | outbound | Per-tenant OAuth; sends from the client's own address. `transmit()` exists and is unreachable until the gates open. |
 | `quo` | inbound, read-only | Quo (formerly OpenPhone). Exports **no** `transmit()` — it cannot send by construction, not by configuration. Safe to run live. |
 
-Quo's response envelope has not yet been seen against a live workspace.
-`adapters.quo.probe(tenantId)` calls each endpoint and reports the keys that
-actually came back, so `FIELDS` is corrected from evidence. One gotcha already
-caught from the docs: Quo authenticates with the **bare API key**, not
-`Bearer <key>`.
+### Quo
+
+Verified 2026-09-18 against Quo's published OpenAPI 3.1 spec and the docs at
+`quo.com/docs`:
+
+| | |
+|---|---|
+| Base | `https://api.quo.com` (paths carry their own `/v1`) |
+| Auth | `Authorization: <API_KEY>` — the **bare key**, *not* `Bearer <key>` |
+| Rate limit | 10 requests/second per key (the adapter throttles to ~8/s) |
+| Key | Quo → Settings → API. Owner or Admin only. |
+
+Three things the spec makes non-obvious, each of which will silently ingest
+nothing if you get it wrong:
+
+1. `direction` is `"incoming"` / `"outgoing"` — **not** `"inbound"` /
+   `"outbound"`. Filtering on the wrong word matches every row and stores none.
+2. `GET /v1/messages` and `GET /v1/calls` both **require** `phoneNumberId`
+   *and* `participants`. There is no "everything on this number" call, so
+   `poll()` walks `/v1/conversations` first to learn who the participants are.
+3. `maxResults` is required (1–100); lists come back as
+   `{ data, totalItems, nextPageToken }` with a nullable token.
+
+Two more the spec does *not* state, found only by running against the live API
+(2026-09-18, elite-pools):
+
+4. **`participants` accepts at most one number.** The spec types it as an
+   unbounded array; the server answers `400 "Expected array length to be less
+   or equal to 1"`. A group conversation must be split into one request per
+   counterparty, so `poll()` flattens conversations to a distinct set of
+   counterparties and walks those.
+5. **A missing call summary is a `404`, not a plan limit.** On an account where
+   summaries demonstrably work, `404` is the ordinary answer for a call Quo
+   never summarized (no-answer, very short, or outside its summarization
+   window) — in the elite-pools run, 46 of 101 incoming calls. Only `402`/`403`
+   mean the plan or the key. Treating `404` as a plan limit reports a billing
+   problem that does not exist.
+
+A call with no summary is still ingested, with `body` left null.
+
+**Read-only by construction.** The adapter exports no `transmit()`, and every
+request funnels through `assertReadOnlyPath()`, which rejects any non-`GET` and
+any write-capable Quo path (`/v1/webhooks`, `/v1/tasks`, `/v1/contacts`,
+`mark-as-*`) before a socket is opened. `test/comms.test.js` drives a full
+`poll()` and `probe()` through a recording fetch and asserts the set of HTTP
+verbs used is exactly `['GET']`.
+
+```
+cp .env.example .env     # then put the key in QUO_API_KEY
+npm run verify:quo       # probes, polls, prints a sample. Reads only.
+```
+
+`QUO_API_KEY` resolves per-tenant storage first, then
+`createComms({ quo: { apiKey } })`, then the environment — so the same build
+runs multi-tenant locally and single-tenant on Railway with the key in
+Variables. `.env` is gitignored (as is any `*.env`); never commit a key.
 
 ## Use
 
@@ -72,6 +123,7 @@ await comms.pollAll({ tenant: 'elite-pools', config });
 | `connections` | Credential storage port — `save` / `get` / `remove`. See `lib/connections.js`. Omit it and comms keeps its own `comms_connections` table. |
 | `sendEnabled` | Global kill switch. Omit and the environment decides; pass `false` to pin it off. |
 | `gmail` | `{ clientId, clientSecret, redirectUri }`, falling back to `GMAIL_*` env vars. |
+| `quo` | `{ apiKey }`, falling back to `QUO_API_KEY`. Per-tenant stored keys win over both. |
 | `fetchImpl` | Injectable `fetch`, for tests. |
 
 ## Storage
@@ -87,5 +139,5 @@ tables, a queued draft is not a send and must never be written there.
 npm test
 ```
 
-26 tests, one per guardrail. They are the specification — each fails loudly if
+34 tests, one per guardrail. They are the specification — each fails loudly if
 someone loosens the thing it guards.
