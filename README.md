@@ -40,6 +40,34 @@ createComms({ db, sendEnabled: false })
 | `gmail` | outbound | Per-tenant OAuth; sends from the client's own address. `transmit()` exists and is unreachable until the gates open. |
 | `quo` | inbound, read-only | Quo (formerly OpenPhone). Exports **no** `transmit()` — it cannot send by construction, not by configuration. Safe to run live. |
 
+### Gmail for agents behind the gateway (Comms V1)
+
+For any agent the platform gateway runs, **Gmail does not go through this
+package's adapter.** The gateway holds the Gmail token and performs each mail
+action itself, after checking that agent's permissions (design note *Comms
+Layer (Gmail)*, decision G1). The agent calls the gateway's internal
+`POST /internal/comms/<action>` and never holds a token. See the gateway's
+`lib/comms.js`, `lib/comms-gmail.js` and `docs/RAILWAY-RUNBOOK.md` (Comms V1).
+
+Why the Gmail REST calls live in the gateway for this first version:
+
+- **The gateway doesn't depend on this package.** Adding it would mean a new
+  npm dependency pinned to a git branch, pulled into the one public service.
+- **The error rule differs.** This adapter puts up to 400 characters of
+  Google's response body into its error messages. The gateway never builds an
+  error from a response body.
+
+The gateway's functions take an access token and a `fetch` and know nothing
+about the gateway, so they can move here unchanged once this package is
+published as a tagged release. Until then:
+
+- **Don't connect a gateway tenant's Gmail through this adapter's OAuth.** It
+  asks for `gmail.send` + `gmail.compose`; the gateway asks for `gmail.modify`.
+  The same mailbox connected twice would hold two grants with different reach.
+- **This adapter's gates are unchanged.** `transmit()` is still unreachable
+  until every gate in `lib/interface.js` opens, and the global switch is still
+  off.
+
 ### Quo
 
 Verified 2026-09-18 against Quo's published OpenAPI 3.1 spec and the docs at
