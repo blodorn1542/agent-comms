@@ -38,7 +38,7 @@ createComms({ db, sendEnabled: false })
 | Adapter | Direction | Notes |
 |---|---|---|
 | `gmail` | outbound | Per-tenant OAuth; sends from the client's own address. `transmit()` exists and is unreachable until the gates open. |
-| `quo` | inbound, read-only | Quo (formerly OpenPhone). Exports **no** `transmit()` — it cannot send by construction, not by configuration. Safe to run live. |
+| `quo` | inbound, read-only | Quo (formerly OpenPhone). Exports **no** `transmit()` — it cannot send by construction, not by configuration. Safe to run live. Since 2026-09-27 it *reads* texts in both directions (an outgoing text is stored as `direction: 'outbound'`, so "did the office reply?" has an answer); calls stay incoming only. |
 
 ### Quo
 
