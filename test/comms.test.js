@@ -499,18 +499,88 @@ test('a group conversation is queried one participant at a time', async () => {
   c.connections.save('tq-grp', 'quo', { accessToken: 'k', refreshToken: null });
   await c.poll({ tenant: 'tq-grp', config: cfg(), provider: 'quo' });
 
-  const queried = log
-    .filter((r) => r.url.includes('/v1/messages') || r.url.includes('/v1/calls'))
+  const params = (kind) => log.filter((r) => r.url.includes(kind))
     .map((r) => new URL(r.url).searchParams.getAll('participants'));
 
-  assert.ok(queried.length > 0, 'messages and calls were requested');
-  for (const p of queried) {
-    assert.equal(p.length, 1, 'Quo rejects more than one participant: got ' + p.join(','));
-  }
-
-  const distinct = [...new Set(queried.map((p) => p[0]))].sort();
-  assert.deepEqual(distinct, ['+15550100', '+15550111', '+15550122'],
+  // /v1/calls really is 1:1 only (spec maxItems 1): one number per request, always.
+  const calls = params('/v1/calls');
+  assert.ok(calls.length > 0, 'calls were requested');
+  for (const p of calls) assert.equal(p.length, 1, 'Quo rejects more than one call participant: got ' + p.join(','));
+  assert.deepEqual([...new Set(calls.map((p) => p[0]))].sort(), ['+15550100', '+15550111', '+15550122'],
     'every counterparty is covered exactly once, and the tenant\'s own number is excluded');
+
+  // /v1/messages: each number's 1:1 thread, plus the group thread with ALL its members (2026-09-28).
+  const msgs = params('/v1/messages');
+  assert.deepEqual(msgs.filter((p) => p.length === 1).map((p) => p[0]).sort(), ['+15550100', '+15550111', '+15550122']);
+  assert.deepEqual(msgs.filter((p) => p.length > 1).map((p) => [...p].sort()), [['+15550111', '+15550122']],
+    'the group thread was not read with both its members');
+});
+
+/*
+ * 2026-09-28: a group thread (the office line + two outside numbers) relayed
+ * three closing requests; the poll saw the conversation update and read 0
+ * messages, because one-number queries return only 1:1 threads.
+ */
+function groupWorkspace({ groupStatus = 200 } = {}) {
+  const log = [];
+  const GROUP = ['+16315375055', '+15165550100'];
+  const groupMsgs = [
+    { id: 'G1', direction: 'incoming', from: '+16315375055', to: ['+15550199', '+15165550100'],
+      text: 'Close 29 hedge row lane the week of October 19th', conversationId: 'CNG', status: 'received', createdAt: '2026-09-28T14:51:00Z' },
+    { id: 'G2', direction: 'incoming', from: '+16315375055', to: ['+15550199', '+15165550100'],
+      text: 'Can you please close my pool when you are able?? 47 Leo\'s Path', conversationId: 'CNG', status: 'received', createdAt: '2026-09-28T17:40:00Z' },
+  ];
+  const fetchImpl = async (url, init = {}) => {
+    log.push({ url, method: init.method ?? 'GET' });
+    const u = new URL(url);
+    const reply = (status, body) => ({ ok: status < 300, status, text: async () => JSON.stringify(body) });
+    if (u.pathname === '/v1/phone-numbers') return reply(200, { data: [{ id: 'PN1', number: '+15550199' }] });
+    if (u.pathname === '/v1/conversations') {
+      // Only the 7-day read (not the cursor's recent one) still lists the group thread.
+      const recent = new Date(u.searchParams.get('updatedAfter')) > new Date('2026-09-28T18:00:00Z');
+      return reply(200, { data: recent ? [] : [{ id: 'CNG', participants: GROUP }], nextPageToken: null });
+    }
+    if (u.pathname === '/v1/messages') {
+      const p = u.searchParams.getAll('participants');
+      if (p.length > 1) return groupStatus === 200 ? reply(200, { data: groupMsgs, nextPageToken: null })
+        : reply(groupStatus, { message: 'Expected array length to be less or equal to 1' });
+      return reply(200, { data: [], nextPageToken: null });
+    }
+    return reply(200, { data: [], nextPageToken: null });
+  };
+  return { fetchImpl, log, GROUP };
+}
+
+test('group texts: read with all members together, within 7 days, even after the cursor passed them', async () => {
+  const ws = groupWorkspace();
+  const c = createComms({ dbPath: DB, fetchImpl: ws.fetchImpl });
+  c.connections.save('tq-grp2', 'quo', { accessToken: 'k', refreshToken: null });
+  // The cursor is already past both messages (every group text before this fix).
+  c.store.setCursor('tq-grp2', 'quo', 'number:PN1', '2026-09-28T19:45:00Z');
+
+  const out = await c.adapters.quo.poll({ tenantId: 'tq-grp2', config: cfg(), now: new Date('2026-09-28T20:00:00Z') });
+  assert.equal(out.newRows, 2, out.note);
+  const rows = c.store.recentInbound('tq-grp2', 10);
+  const g1 = rows.find((r) => r.external_id === 'G1');
+  assert.equal(g1.channel, 'sms');
+  assert.equal(g1.direction, 'inbound');
+  assert.equal(g1.from_addr, '+16315375055', 'threaded under the sender');
+  assert.equal(g1.body, 'Close 29 hedge row lane the week of October 19th');
+  assert.deepEqual(JSON.parse(g1.meta_json).groupParticipants, ws.GROUP);
+  assert.match(out.note, /group texts: 1 thread\(s\) read in the last 7 days, 2 new message\(s\)/);
+
+  const again = await c.adapters.quo.poll({ tenantId: 'tq-grp2', config: cfg(), now: new Date('2026-09-28T20:15:00Z') });
+  assert.equal(again.newRows, 0, 'a re-read of the window stores nothing twice');
+  assert.ok(ws.log.every((r) => r.method === 'GET'));
+});
+
+test('group texts: a Quo refusal is noted, never fatal, and 1:1 traffic is unaffected', async () => {
+  const ws = groupWorkspace({ groupStatus: 400 });
+  const c = createComms({ dbPath: DB, fetchImpl: ws.fetchImpl });
+  c.connections.save('tq-grp3', 'quo', { accessToken: 'k', refreshToken: null });
+  const out = await c.adapters.quo.poll({ tenantId: 'tq-grp3', config: cfg(), now: new Date('2026-09-28T20:00:00Z') });
+  assert.equal(out.ok, true);
+  assert.match(out.note, /Quo REFUSED 1 group read/);
 });
 
 /* ------------------------- guardrail: Quo is read-only at the wire level --- */
