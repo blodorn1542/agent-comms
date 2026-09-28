@@ -416,6 +416,54 @@ test('a 403 on summaries is reported as the plan limit it is', async () => {
   assert.match(out.note, /Business\/Scale/);
 });
 
+/**
+ * 2026-09-28: a closing request left as a voicemail reached Bear as an empty
+ * call - the summary carries nothing for an unanswered call. The voicemail's
+ * transcript is what the caller said, read from its own endpoint.
+ */
+function voicemailAdapter(respond, log = []) {
+  const fetchImpl = async (url, init = {}) => {
+    log.push({ url, method: init.method || 'GET' });
+    const r = respond(url);
+    return { ok: r.status === 200, status: r.status, text: async () => JSON.stringify(r.body ?? {}) };
+  };
+  const c = createComms({ dbPath: DB, fetchImpl });
+  c.connections.save('tq-vm', 'quo', { accessToken: 'k', refreshToken: null });
+  return c.adapters.quo;
+}
+
+test('a completed voicemail comes back with its transcript, by a GET to its own endpoint', async () => {
+  const log = [];
+  const quo = voicemailAdapter(() => ({ status: 200, body: { data: {
+    id: 'VM1', status: 'completed', duration: 28, recordingUrl: 'https://x/vm.mp3',
+    transcript: '  Hi, it is 167 Breeze Lane, please start our pool shutdown.  ' } } }), log);
+  const vm = await quo.getCallVoicemail('tq-vm', 'AC123');
+  assert.deepEqual(vm, { status: 'completed', transcript: 'Hi, it is 167 Breeze Lane, please start our pool shutdown.', duration: 28 });
+  assert.equal(log.length, 1);
+  assert.equal(log[0].method, 'GET');
+  assert.match(log[0].url, /\/v1\/call-voicemails\/AC123$/);
+});
+
+test('a voicemail still processing is in-progress, not empty - the caller asks again later', async () => {
+  const quo = voicemailAdapter(() => ({ status: 200, body: { data: {
+    id: 'VM1', status: 'in-progress', duration: null, recordingUrl: null, transcript: null } } }));
+  assert.deepEqual(await quo.getCallVoicemail('tq-vm', 'AC1'), { status: 'in-progress', transcript: null, duration: null });
+  const quoNull = voicemailAdapter(() => ({ status: 200, body: { data: null } }));
+  assert.equal((await quoNull.getCallVoicemail('tq-vm', 'AC1')).status, 'in-progress');
+});
+
+test('no voicemail on the call is "none"; a plan or key refusal is "unavailable"; anything else throws', async () => {
+  assert.equal((await voicemailAdapter(() => ({ status: 404 })).getCallVoicemail('tq-vm', 'AC1')).status, 'none');
+  assert.equal((await voicemailAdapter(() => ({ status: 400 })).getCallVoicemail('tq-vm', 'AC1')).status, 'none');
+  assert.equal((await voicemailAdapter(() => ({ status: 403 })).getCallVoicemail('tq-vm', 'AC1')).status, 'unavailable');
+  await assert.rejects(voicemailAdapter(() => ({ status: 500 })).getCallVoicemail('tq-vm', 'AC1'), /Quo 500/);
+});
+
+test('a completed voicemail with no words has a null transcript', async () => {
+  const quo = voicemailAdapter(() => ({ status: 200, body: { data: { id: 'VM1', status: 'completed', duration: 3, transcript: '   ' } } }));
+  assert.deepEqual(await quo.getCallVoicemail('tq-vm', 'AC1'), { status: 'completed', transcript: null, duration: 3 });
+});
+
 test('the required phoneNumberId and participants params are actually sent', async () => {
   const log = [];
   const c = createComms({ dbPath: DB, fetchImpl: recordingFetch(quoWorkspace(), log) });
