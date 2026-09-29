@@ -353,6 +353,12 @@ test('Quo ingest keeps texts both ways and calls incoming only, using Quo\'s rea
   assert.match(call.body, /pool heater/);
   assert.match(call.body, /Next steps: Send a quote\./);
   assert.equal(call.from_addr, '+15550100', 'the caller, not the tenant\'s own number');
+  // The call carries its conversation (2026-09-29, Paul: "brought to the
+  // correct call"): the caller's one-to-one conversation on this line, so
+  // my.quo.com/inbox/PN1/c/CN1 opens it. The API's call row has none.
+  const meta = JSON.parse(call.meta_json);
+  assert.equal(meta.conversationId, 'CN1');
+  assert.equal(meta.phoneNumberId, 'PN1');
 });
 
 test('a call with no summary is still recorded, without one', async () => {
