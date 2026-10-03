@@ -321,18 +321,33 @@ function recordingFetch(pages, log = []) {
   };
 }
 
-test('Quo ingest keeps texts both ways and calls incoming only, using Quo\'s real direction vocabulary', async () => {
-  const c = createComms({ dbPath: DB, fetchImpl: recordingFetch(quoWorkspace()) });
+test('Quo ingest keeps texts and calls both ways, reads words for incoming calls only, using Quo\'s real direction vocabulary', async () => {
+  const log = [];
+  const c = createComms({ dbPath: DB, fetchImpl: recordingFetch(quoWorkspace(), log) });
   c.connections.save('tq', 'quo', { accessToken: 'key-123', refreshToken: null });
 
   const out = await c.poll({ tenant: 'tq', config: cfg(), provider: 'quo' });
   assert.equal(out.ok, true);
   assert.equal(out.messages, 2, 'both directions are seen');
   assert.equal(out.calls, 2);
-  assert.equal(out.newRows, 3, 'both texts and the incoming call are stored; the outgoing call is not');
+  assert.equal(out.newRows, 4, 'both texts and both calls are stored');
 
   const stored = c.store.recentInbound('tq', 10);
-  assert.deepEqual(stored.map((r) => r.external_id).sort(), ['AC1', 'M1', 'M2']);
+  assert.deepEqual(stored.map((r) => r.external_id).sort(), ['AC1', 'AC2', 'M1', 'M2']);
+
+  // The office calling back (2026-10-03): outbound, office line as from, the
+  // customer as to, no words - and no summary or transcript request for it.
+  const back = stored.find((r) => r.external_id === 'AC2');
+  assert.equal(back.direction, 'outbound');
+  assert.equal(back.channel, 'call');
+  assert.equal(back.from_addr, '+15550199');
+  assert.equal(back.to_addr, '+15550100');
+  assert.equal(back.body, null);
+  assert.equal(JSON.parse(back.meta_json).status, 'completed');
+  assert.equal(JSON.parse(back.meta_json).duration, 12);
+  const summaryAsks = log.filter((r) => r.url.includes('/v1/call-summaries/'));
+  assert.equal(summaryAsks.length, 1, 'one summary request, for the incoming call');
+  assert.ok(summaryAsks[0].url.includes('AC1'));
 
   // The office's reply (2026-09-27): stored as outbound, office line as
   // from, customer as to - what the customer-service queue matches a reply on.
@@ -368,7 +383,7 @@ test('a call with no summary is still recorded, without one', async () => {
   c.connections.save('tq-abs', 'quo', { accessToken: 'k', refreshToken: null });
 
   const out = await c.poll({ tenant: 'tq-abs', config: cfg(), provider: 'quo' });
-  assert.equal(out.newRows, 3, 'the call is ingested even with no summary (plus both texts)');
+  assert.equal(out.newRows, 4, "the call is ingested even with no summary (plus both texts and the outgoing call)");
   assert.match(out.note, /no-answer/,
     'an absent summary is normal, and must not be blamed on the plan');
   assert.doesNotMatch(out.note, /Business\/Scale/);
@@ -398,7 +413,7 @@ test('a 404 on summaries is not blamed on the plan', async () => {
   c.connections.save('tq-404', 'quo', { accessToken: 'k', refreshToken: null });
 
   const out = await c.poll({ tenant: 'tq-404', config: cfg(), provider: 'quo' });
-  assert.equal(out.newRows, 3, 'a 404 on the summary never loses the call itself (plus both texts)');
+  assert.equal(out.newRows, 4, "a 404 on the summary never loses the call itself (plus both texts and the outgoing call)");
   assert.doesNotMatch(out.note, /Business\/Scale/);
   assert.match(out.note, /never summarized/);
 });
@@ -418,7 +433,7 @@ test('a 403 on summaries is reported as the plan limit it is', async () => {
   c.connections.save('tq-403', 'quo', { accessToken: 'k', refreshToken: null });
 
   const out = await c.poll({ tenant: 'tq-403', config: cfg(), provider: 'quo' });
-  assert.equal(out.newRows, 3, 'a 403 on the summary never loses the call itself (plus both texts)');
+  assert.equal(out.newRows, 4, "a 403 on the summary never loses the call itself (plus both texts and the outgoing call)");
   assert.match(out.note, /Business\/Scale/);
 });
 
